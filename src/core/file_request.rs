@@ -1,12 +1,12 @@
-use std::fmt::Display;
 use std::time::Duration;
 use reqwest::header::{CONTENT_LENGTH, HeaderMap, USER_AGENT};
 use anyhow::Result;
 use reqwest::{Client, Proxy, Response};
 
+#[derive(Debug, Clone)]
 pub struct FileRequest {
     url: String,
-    headers: HeaderMap,
+    pub headers: HeaderMap,
     proxy: Option<String>,
 }
 
@@ -19,9 +19,9 @@ impl FileRequest {
         }
     }
 
-    pub fn insert_header(mut self, key: impl AsRef<str> + reqwest::header::IntoHeaderName, value: impl AsRef<str>) -> Result<Self> {
+    pub fn insert_header(&mut self, key: impl AsRef<str> + reqwest::header::IntoHeaderName, value: impl AsRef<str>) -> Result<()> {
         self.headers.insert(key, value.as_ref().parse()?);
-        Ok(self)
+        Ok(())
     }
 
     pub fn create_client(&mut self) -> Result<Client> {
