@@ -2,6 +2,5 @@
 #![crate_name = "easy_download"]
 
 
-mod core;
-mod tests;
+pub mod core;
 

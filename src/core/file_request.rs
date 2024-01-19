@@ -24,6 +24,10 @@ impl FileRequest {
         Ok(())
     }
 
+    pub fn set_proxy(&mut self, proxy: impl AsRef<str>) {
+        self.proxy = Some(proxy.as_ref().to_string())
+    }
+
     pub fn create_client(&mut self) -> Result<Client> {
         // 没有浏览器标识就添加 Google浏览器 请求标识
         if !self.headers.contains_key(USER_AGENT) {

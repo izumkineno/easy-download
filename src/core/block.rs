@@ -1,15 +1,20 @@
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+use std::time::Duration;
 use anyhow::{Result, format_err};
 use byte_unit::{Byte, UnitType};
 use reqwest::header::RANGE;
 use tokio::fs::OpenOptions;
 use crate::core::file_request::FileRequest;
-use futures::StreamExt;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc::{channel, Receiver};
+use tokio::join;
+use tokio::sync::mpsc::error::TryRecvError;
 
-#[derive(Debug, Clone)]
+
+#[derive(Debug)]
 pub struct Block {
     /// 开始位置
     start: u64,
@@ -26,11 +31,13 @@ pub struct Block {
     /// 重试最大次数
     retry_max: u32,
     /// 请求句柄
-    request: Arc<Mutex<FileRequest>>,
+    request: FileRequest,
+
+    rx: Arc<Mutex<Option<Receiver<u64>>>>,
 }
 
 impl Block {
-    pub fn new(start: u64, end: u64, dir: PathBuf, name: impl AsRef<str>, retry_max: u32, request: Arc<Mutex<FileRequest>>) -> Self {
+    pub fn new(start: u64, end: u64, dir: PathBuf, name: impl AsRef<str>, retry_max: u32, request: FileRequest) -> Self {
         Self {
             start,
             end,
@@ -40,18 +47,25 @@ impl Block {
             retry: 0,
             retry_max,
             request,
+            rx: Arc::new(Mutex::new(None)),
         }
     }
 
+    pub fn is_complete(&self) -> bool {
+        self.current + self.start >= self.end
+    }
+
+    pub fn get_progress(&self) -> Arc<Mutex<Option<Receiver<u64>>>> {
+        self.rx.clone()
+    }
+
     pub async fn request(&mut self) -> Result<()> {
-        let mut req = self.request.lock().await;
-        if req.headers.contains_key(RANGE) {
-            req.headers.remove(RANGE);
+        if self.request.headers.contains_key(RANGE) {
+            self.request.headers.remove(RANGE);
         }
-        req.insert_header(RANGE, format!("bytes={}-{}", &self.start, &self.end))?;
-        match req.get().await {
-            Ok(res) => {
-                let mut stream = res.bytes_stream();
+        self.request.insert_header(RANGE, format!("bytes={}-{}", &self.start, &self.end))?;
+        match self.request.get().await {
+            Ok(mut res) => {
                 // 创建分块文件
                 let file_path = self.dir.join(&self.name);
                 let mut file = OpenOptions::new()
@@ -61,21 +75,19 @@ impl Block {
                     .open(file_path)
                     .await?;
 
+                let (tx, rx) = channel(48);
+                self.rx.lock().unwrap().replace(rx);
+
+
                 // 下载进度相关， 重要
-                let mut block_size = 0;
-                while let Some(chunk) = stream.next().await {
-                    let mut chunk = chunk?;
-
-                    block_size = chunk.len() as u64;
-                    self.current += block_size;
-
+                while let Some(chunk) = res.chunk().await? {
+                    self.current += chunk.len() as u64;
                     // 成功写入或失败才会结束
-                    file.write_all_buf(&mut chunk).await?;
-
-                    println!("download size: {:.2}, block size: {:.2}",
-                             Byte::from_u64(self.current).get_appropriate_unit(UnitType::Binary),
-                             Byte::from_u64(block_size).get_appropriate_unit(UnitType::Binary));
+                    let r = file.write_all(&chunk);
+                    let t = tx.send(self.current);
+                    join!(r, t);
                 }
+                // file.flush().await?;
             }
             Err(err) => {
                 self.retry += 1;
