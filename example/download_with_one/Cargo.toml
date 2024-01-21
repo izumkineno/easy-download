@@ -9,3 +9,5 @@ edition = "2021"
 easy-download = { path = "../../" }
 tokio = "1.35.1"
 byte-unit = { version = "5.1.3", features = ["byte"] }
+futures = "0.3.30"
+anyhow = "1.0.79"

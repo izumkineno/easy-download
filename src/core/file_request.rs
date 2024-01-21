@@ -51,6 +51,7 @@ impl FileRequest {
     }
 
     pub async fn get(&mut self) -> Result<Response> {
+        println!("get");
         Ok(self.create_client()?
             .get(&self.url)
             .send()
