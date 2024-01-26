@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -7,12 +8,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::spawn;
 use tokio::sync::mpsc::Receiver;
 
-use reqwest::header::HeaderMap;
-use anyhow::Result;
+use anyhow::{format_err, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::core::block::Block;
 use crate::core::file_request::FileRequest;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileTask {
     /// 文件名
     name: Option<String>,
@@ -21,7 +23,7 @@ pub struct FileTask {
     /// 下载链接
     url: String,
     /// 请求头
-    pub headers: HeaderMap,
+    pub headers: HashMap<String, String>,
     /// 代理
     proxy: Option<String>,
     /// 线程数
@@ -42,7 +44,7 @@ impl FileTask {
             name: None,
             tail: "ed".to_string(),
             url: url.as_ref().to_string(),
-            headers: HeaderMap::new(),
+            headers: HashMap::new(),
             dir: std::env::current_dir()?.join("temp"),
             output: std::env::current_dir()?.join("Downloads"),
             proxy: None,
@@ -65,7 +67,7 @@ impl FileTask {
     }
 
     pub fn insert_header(&mut self, key: impl AsRef<str> + reqwest::header::IntoHeaderName, value: impl AsRef<str>) -> anyhow::Result<()> {
-        self.headers.insert(key, value.as_ref().parse()?);
+        self.headers.insert(String::from(key.as_ref()), value.as_ref().parse()?);
         Ok(())
     }
 
@@ -73,12 +75,12 @@ impl FileTask {
         self.retry = retry
     }
 
-    pub fn set_dir(&mut self, dir: impl AsRef<Path>) {
+    pub fn set_tmp_dir(&mut self, dir: impl AsRef<Path>) {
         self.dir = dir.as_ref().to_owned()
     }
 
-    pub fn set_output(&mut self, dir: impl AsRef<PathBuf>) {
-        self.output = dir.as_ref().to_path_buf()
+    pub fn set_output(&mut self, dir: impl AsRef<Path>) {
+        self.output = dir.as_ref().to_owned()
     }
 
     pub fn filename(&self) -> &str {
@@ -100,17 +102,28 @@ impl FileTask {
     pub fn get_size(&self) -> u64 {
         self.size
     }
+
+    pub fn get_tmp_dir(&self) -> &PathBuf {
+        &self.dir
+    }
+
+    pub fn get_output(&self) -> &PathBuf {
+        &self.output
+    }
 }
 
 impl FileTask {
-    pub async fn start(&mut self) -> Result<Vec<Arc<Mutex<Option<Receiver<u64>>>>>> {
+    pub async fn start(&mut self, resume: Option<Vec<u64>>) -> Result<Vec<Arc<Mutex<Option<Receiver<u64>>>>>> {
+        let resume_flag = resume.is_some();
+        let resume = resume.unwrap_or_default();
+
         self.dir = self.dir.join(self.get_name());
         // 创建文件路径
         create_dir_all(&self.dir)?;
         create_dir_all(&self.output)?;
         // 创建基础请求
         let mut req = FileRequest::new(&self.url);
-        req.headers = self.headers.clone();
+        req.headers = self.headers.clone().iter().map(|(key, value)| (key.parse().unwrap(), value.parse().unwrap())).collect();
         if let Some(p) = self.proxy.as_ref() {
             req.set_proxy(p)
         }
@@ -127,7 +140,19 @@ impl FileTask {
         for i in 0..self.thread {
             let start = block_size * (i as u64);
             let end = if i == self.thread - 1 { self.size - 1 } else { block_size * ((i + 1) as u64) - 1 };
-            let mut block = Block::new(start, end, &self.dir, format!("{}.{}{i}", &self.get_name(), &self.tail), self.retry, req.clone());
+
+            let mut block = Block::new(
+                start,
+                end,
+                &self.dir,
+                format!("{}.{}{i}", &self.get_name(), &self.tail),
+                self.retry,
+                req.clone()).await?;
+
+            if resume_flag {
+                let v = resume[i as usize];
+                block.set_current(v);
+            }
 
             // 进度
             let r = block.get_progress();
@@ -143,25 +168,35 @@ impl FileTask {
         Ok(progress)
     }
 
-    pub async fn merge(&mut self) -> Result<()> {
-        let save_path = self.output.join(self.get_name());
+    pub fn get_blocks_file(&self) -> Result<Vec<PathBuf>> {
         let mut file_tmp_path = Vec::with_capacity(self.thread as usize);
-
         for i in 0..self.thread {
             let path = self.dir.clone().join(format!("{}.{}{}", self.get_name(), &self.tail, i));
             if path.is_file() {
                 file_tmp_path.push(path);
             } else {
-                eprintln!("file not exist: {}", path.display());
+                panic!("file not exist: {}", path.display());
             }
         }
+        Ok(file_tmp_path)
+    }
+
+    pub async fn merge(&mut self) -> Result<()> {
+        let save_path = self.output.join(self.get_name());
+
+        let file_tmp_path = self.get_blocks_file()?;
 
         dbg!(&file_tmp_path);
         dbg!(&save_path);
 
         let mut f = vec![];
         for path in file_tmp_path {
-            f.extend(std::fs::read(path)?);
+            if std::fs::metadata(&path)?.len() >= self.size / self.thread as u64 {
+                f.extend(std::fs::read(path)?);
+            } else {
+                panic!("file not exist: {}", path.display());
+            }
+
         }
         let mut file = File::create(save_path).await?;
         file.write_all(&f).await?;
@@ -171,4 +206,5 @@ impl FileTask {
     pub async fn remove(&mut self) -> Result<()> {
         Ok(remove_dir_all(&self.dir).await?)
     }
+
 }
