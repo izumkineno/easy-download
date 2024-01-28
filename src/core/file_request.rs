@@ -1,5 +1,5 @@
 use std::time::Duration;
-use reqwest::header::{CONTENT_LENGTH, HeaderMap, USER_AGENT};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, USER_AGENT};
 use anyhow::Result;
 use reqwest::{Client, Proxy, Response};
 
@@ -55,7 +55,6 @@ impl FileRequest {
     }
 
     pub async fn get(&mut self) -> Result<Response> {
-        println!("get");
         Ok(self.create_client()?
             .get(&self.url)
             .send()
@@ -63,13 +62,15 @@ impl FileRequest {
         )
     }
 
-    pub async fn get_size(&mut self) -> Result<u64> {
+    pub async fn get_size(&mut self) -> Result<(u64, bool)> {
         let res = self.get().await?;
+        let headers = res.headers();
 
-        let file_size: u64 = match res.headers().get(CONTENT_LENGTH) {
+        let file_size: u64 = match headers.get(CONTENT_LENGTH) {
             None => 0,
             Some(length) => length.to_str().unwrap().parse().unwrap(),
         };
-        Ok(file_size)
+        let is_resumed = headers.contains_key(ACCEPT_RANGES) || headers.contains_key(CONTENT_RANGE);
+        Ok((file_size, is_resumed))
     }
 }

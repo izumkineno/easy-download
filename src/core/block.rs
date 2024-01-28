@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc::{channel, Receiver};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::join;
 
 use anyhow::{Result, format_err};
@@ -12,7 +12,7 @@ use reqwest::header::RANGE;
 
 use crate::core::file_request::FileRequest;
 
-
+#[warn(dead_code)]
 #[derive(Debug)]
 pub struct Block {
     /// 块文件句柄
@@ -51,8 +51,7 @@ impl Block {
             .write(true)
             .open(file_path)
             .await?;
-        Ok(
-            Self {
+        Ok(Self {
                 file,
                 start,
                 end,
@@ -67,14 +66,6 @@ impl Block {
         })
     }
 
-    pub fn is_complete(&self) -> bool {
-        self.current + self.start >= self.end
-    }
-
-    pub fn get_progress(&self) -> Arc<Mutex<Option<Receiver<u64>>>> {
-        self.rx.clone()
-    }
-
     pub fn set_rx_size(&mut self, rx_size: usize) {
         self.rx_size = rx_size
     }
@@ -86,25 +77,24 @@ impl Block {
 }
 
 impl Block {
-    async fn download(&mut self, mut res: reqwest::Response) -> Result<()> {
-        self.retry = 0;
 
-        // 缓存过低会导致传输中断
-        let (tx, rx) = channel(self.rx_size);
-        self.rx.lock().unwrap().replace(rx);
+    pub fn is_complete(&self) -> bool {
+        self.current + self.start >= self.end
+    }
 
-        println!("start download: {}", &self.name);
+    pub fn get_progress(&self) -> Arc<Mutex<Option<Receiver<u64>>>> {
+        self.rx.clone()
+    }
 
 
+    async fn download(&mut self, mut res: reqwest::Response, tx: Sender<u64>) -> Result<()> {
         while let Some(chunk) = res.chunk().await? {
             let mut chunk = chunk;
             self.current += chunk.len() as u64;
-            // 成功写入或失败才会结束
             let r = self.file.write_all_buf(&mut chunk);
             let t = tx.send_timeout(self.current, Duration::from_nanos(10));
-            join!(r, t);
+            let _ = join!(r, t);
         }
-        println!("downloaded: {} , {} - {}", self.name, self.end - self.start, self.current );
         self.file.flush().await?;
         Ok(())
     }
@@ -122,11 +112,19 @@ impl Block {
     }
 
     pub async fn request(&mut self) -> Result<()> {
+        // 缓存过低会导致传输中断
+        let (tx, rx) = channel(self.rx_size);
+        self.rx.lock().unwrap().replace(rx);
+        if self.is_complete() {
+            tx.send(self.current).await?;
+            return Ok(())
+        }
+
         self.request.insert_header(RANGE, format!("bytes={}-{}", self.start + self.current, self.end))?;
-        dbg!(&self.request);
         match self.request.get().await {
             Ok(res) => {
-                self.download(res).await?;
+                self.retry = 0;
+                self.download(res, tx).await?;
             }
             Err(err) => {
                 self.download_error_handler(err).await?;

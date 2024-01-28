@@ -62,6 +62,10 @@ impl FileTask {
         self.thread = thread
     }
 
+    pub fn get_thread(&self) -> u8 {
+        self.thread
+    }
+
     pub fn set_tail(&mut self, tail: impl AsRef<str>) {
         self.tail = tail.as_ref().to_string()
     }
@@ -127,12 +131,14 @@ impl FileTask {
         if let Some(p) = self.proxy.as_ref() {
             req.set_proxy(p)
         }
-        dbg!(&req);
 
         // 获取文件大小
-        self.size = req.get_size().await?;
+        let (size, is_resumed) = req.get_size().await?;
+        self.size = size;
+        if !is_resumed {
+            self.thread = 1;
+        }
 
-        dbg!(&self.size);
         let block_size = self.size / self.thread as u64;
         let mut blocks_handle = Vec::with_capacity(self.thread as usize);
         let mut progress = Vec::with_capacity(self.thread as usize);
@@ -159,7 +165,7 @@ impl FileTask {
             progress.push(r);
 
             let handle = spawn(async move {
-                block.request().await;
+                let _ = block.request().await;
             });
 
             blocks_handle.push(handle);
@@ -175,7 +181,7 @@ impl FileTask {
             if path.is_file() {
                 file_tmp_path.push(path);
             } else {
-                panic!("file not exist: {}", path.display());
+                return Err(format_err!("未获取到块文件: {}", path.display()))
             }
         }
         Ok(file_tmp_path)
@@ -194,7 +200,7 @@ impl FileTask {
             if std::fs::metadata(&path)?.len() >= self.size / self.thread as u64 {
                 f.extend(std::fs::read(path)?);
             } else {
-                panic!("file not exist: {}", path.display());
+                return Err(format_err!("文件不完整: {}", path.display()))
             }
 
         }
@@ -203,7 +209,7 @@ impl FileTask {
         Ok(())
     }
 
-    pub async fn remove(&mut self) -> Result<()> {
+    pub async fn clear_temp(&mut self) -> Result<()> {
         Ok(remove_dir_all(&self.dir).await?)
     }
 
